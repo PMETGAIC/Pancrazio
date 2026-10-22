@@ -1,0 +1,9 @@
+Acquisizione delle immagini e della posa, la stiamo facendo con mediapipe per ora, modelli leggeri su cui si può fare una stima della posizioni relative dei giunti e delle mani. 
+Ma vanno considerati e confrontati modelli di pose estimation assoluta come HyBRIK, ROMP o WHAM. Che sono più pesanti.
+
+sto provando Romp come alternativa. Vecchiotto, ma è un alternativa interessante 4D XYZ T
+
+per esplorare la pose estimation 4D senza esagerare sto provando https://github.com/jeffffffli/HybrIK, cercando di risolvere il tremolio con filtri online
+I modelli sono troppo vecchi, utilizzano librerie deprecate, poco comodi per implentazioni nuove e leggere. 
+
+Usare una depth migliora la pose, dato che il parametro z non viene più stimato ma misurato

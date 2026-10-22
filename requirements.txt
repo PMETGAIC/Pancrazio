@@ -1,0 +1,5 @@
+opencv-python 
+mediapipe 
+matplotlib 
+numpy
+pyrealsense2
