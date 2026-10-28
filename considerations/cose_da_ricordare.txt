@@ -1,9 +1,62 @@
+
+CAPTURE 
+
 Acquisizione delle immagini e della posa, la stiamo facendo con mediapipe per ora, modelli leggeri su cui si può fare una stima della posizioni relative dei giunti e delle mani. 
 Ma vanno considerati e confrontati modelli di pose estimation assoluta come HyBRIK, ROMP o WHAM. Che sono più pesanti.
-
 sto provando Romp come alternativa. Vecchiotto, ma è un alternativa interessante 4D XYZ T
-
 per esplorare la pose estimation 4D senza esagerare sto provando https://github.com/jeffffffli/HybrIK, cercando di risolvere il tremolio con filtri online
 I modelli sono troppo vecchi, utilizzano librerie deprecate, poco comodi per implentazioni nuove e leggere. 
-
 Usare una depth migliora la pose, dato che il parametro z non viene più stimato ma misurato
+
+GENERAZIONE DELLE COPPIE UMANO - ROBOT
+
+Volendo creare un framework generale non posso rimappare direttamente punti scalati e angoli dei giunti, perchè su diversi attuatori le configurazioni sono troppo diverse, 
+es il bi-braccio a 7DOF e un classico 4DOF. Quindi passiamo ad un approggio "Task-Space" 
+
+
+Allora iniziamo la revisioni di lavori (2017-2026) 
+
+TABELLA CATEGORIE
+
+- #Articoli 5
+- (H) Human to Humanoid 4
+- (A) All actuator 1
+- (O) optimization 2
+- (J) joint remapping 2
+- (M) models 1
+- (W) wearable 2
+- (C) Camera 1
+
+
+1. Motion retargeting for humanoid robots based on simultaneous morphing parameter identification and motion optimization (Ayusawa, Yoshida) 2017
+
+IL main goal di questo paiper parla della risoluzione di tre problemi di ottimizzazione, basati sulla cinematica inversa del corpo umano, della rimappatura verso un umanoide tramite un set di parametri theta e della ricostruzione iterative della motion
+
+codice - AHOJ
+
+2. Robust Real-time Whole-Body Motion Retargeting 2018
+
+Vengono fatte considerazioni di proporzioni con il robot iCub (piccolino), i giunti vengono mossi tramite un controllore quadratico che ha come target la copia umana, il baricentro ha una rimappatura a parte per evitare incidenti
+
+codice - WOHJ
+
+3. Neural Kinematic Networks for Unsupervised Motion Retargeting (Villegas et al.) 2018
+
+*Allenato sul gangnam style* 
+
+Architettura dual RNN, un encoder che prende i dati di motion in input (calcolati con FK) e li trasforma in motion features, secondo decoder prevede le rotazioni dei giunti. Il training avviene seguendo un approccio cycle. 
+Essendo più orientato al mondo simulato 3D non vi sono applicazioni dirette su attuatori robotici ma solo su scheletri di personaggi, che possono differire in proporzioni ma non in struttura
+
+codice - CMH
+
+4. Whole-body geometric retargeting for humanoid robots (Darvish et al.) 2019
+
+Anche qui il retargetting viene visto come un problema di ottimizzazione sull'IK, riuscendo a manipolare attuatori simil umano, compreso un bi braccio (circa). Promettente
+
+codice WOHJA
+
+5. A Generative Human-Robot Motion Retargeting Approach Using a Single RGBD Sensor (Wang et al.)
+
+Approccio che utilizza solo una depth per stimare la posizione, va a definire una mesh umana e cerca di massimizzare l'accoppiamento tras la mesh e l'immagine 3d 
+
+codice - 
