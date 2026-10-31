@@ -1,0 +1,1 @@
+Directory che serve per le eventuali catture
