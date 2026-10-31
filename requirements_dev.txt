@@ -1,0 +1,9 @@
+opencv-python 
+mediapipe 
+matplotlib 
+numpy
+pyrealsense2
+mujoco
+qpsolvers 
+osqp
+snakeviz
