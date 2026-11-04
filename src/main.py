@@ -1,7 +1,6 @@
 """Teleoperazione di un robot con MediaPipe + MuJoCo: webcam/video -> posa -> retargeting -> simulazione."""
 import argparse
 import contextlib
-import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -12,11 +11,13 @@ import mujoco.viewer
 
 from src.Capture.human_capture import PoseTracker, Skeleton3DPlot, VideoIO, draw_overlay
 from src.Remapping.retargeting import ArmDirectionExtractor, MujocoController
+from src.Remapping.robot_profile import RobotProfile
+from src.Remapping.validate import validate
 
 MODELS_DIR = Path("./models")
 BASE_URL = "https://storage.googleapis.com/mediapipe-models"
 HAND_URL = f"{BASE_URL}/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-DEFAULT_XML = Path(sys.prefix) / "share" / "openarm_mujoco" / "v2" / "pedestal" / "openarm_pedestal.xml"
+DEFAULT_ROBOT = Path("profiles/openarm.yaml")
 
 DIR_ALPHA = 0.5  # smoothing extra sulle direzioni (1.0 = nessuno; la posa è già filtrata da One Euro)
 
@@ -59,16 +60,13 @@ def build_capture(args):
     return camera, tracker
 
 
-def build_controller(args):
-    # Ordine sinistro, destro: deve coincidere con ArmDirectionExtractor.ARMS
-    return MujocoController(
-        str(args.xml),
-        ee_names=["openarm_left_ee_base_link", "openarm_right_ee_base_link"],
-        shoulder_names=["openarm_left_link3", "openarm_right_link3"],
-        elbow_names=["openarm_left_link4", "openarm_right_link4"],
-        rest_joints={"openarm_left_joint4": 0.8, "openarm_right_joint4": 0.8},
-        debug=args.debug,
-    )
+def build_robot(args):
+    """Profilo -> (controller, estrattore di direzioni). L'ordine dei bracci viene dal profilo."""
+    profile = RobotProfile.from_yaml(args.robot)
+    controller = MujocoController(args.xml or profile.xml, profile.arms, debug=args.debug)
+    if not args.no_validate and not validate(controller)[0]:  # stampa già esito, errori e avvisi
+        return None, None
+    return controller, ArmDirectionExtractor(profile, alpha=DIR_ALPHA)
 
 
 # =============================================================================
@@ -82,10 +80,9 @@ def run_model_only(controller):
             time.sleep(1 / 60)
 
 
-def run_pipeline(args, camera, tracker, controller):
+def run_pipeline(args, camera, tracker, controller, extractor):
     """Loop unico: camera -> tracking -> (opz.) retargeting + viewer. Con controller=None è solo cattura."""
     plot = Skeleton3DPlot() if args.plot3d else None
-    extract = ArmDirectionExtractor(alpha=DIR_ALPHA)
     acc_tracker = acc_qp = 0.0
     n = 0
 
@@ -112,14 +109,14 @@ def run_pipeline(args, camera, tracker, controller):
 
             if controller:
                 t_qp = time.perf_counter()
-                dirs = extract(state)
+                dirs = extractor(state)
                 if dirs is not None:
                     with viewer.lock():
                         controller.track(dirs)
                 viewer.sync()
                 acc_qp += time.perf_counter() - t_qp
 
-            if args.profile:
+            if args.timing:
                 acc_tracker += t1 - t0
                 n += 1
                 if n == 60:
@@ -154,11 +151,14 @@ def parse_args():
     p.add_argument("--beta", type=float, default=0.01,
                    help="One Euro: sensibilità alla velocità (con dati in metri provare valori ~1-5)")
     # Robot
-    p.add_argument("--xml", type=Path, default=DEFAULT_XML, help="Path dell'XML MuJoCo del robot")
+    p.add_argument("--robot", type=Path, default=DEFAULT_ROBOT,
+                   help=f"Profilo robot YAML (default: {DEFAULT_ROBOT}); bozza con src.Remapping.discover")
+    p.add_argument("--xml", type=Path, default=None, help="Override del path XML MuJoCo indicato nel profilo")
+    p.add_argument("--no_validate", action="store_true", help="Salta il controllo delle assunzioni del retargeting")
     # Debug
     p.add_argument("--plot3d", action="store_true", help="Skeleton 3D live in matplotlib (lento)")
-    p.add_argument("--profile", action="store_true", help="Stampa i tempi in ms di tracker e simulazione")
-    p.add_argument("--debug", action="store_true", help="Controller: check geometria e log periodico degli errori")
+    p.add_argument("--timing", action="store_true", help="Stampa i tempi in ms di tracker e simulazione")
+    p.add_argument("--debug", action="store_true", help="Controller: log periodico degli errori IK")
     args = p.parse_args()
 
     if args.only_pose and args.only_hands:
@@ -172,17 +172,21 @@ def parse_args():
 
 def main():
     args = parse_args()
-    camera = tracker = controller = None
+    camera = tracker = controller = extractor = None
     try:
         if not args.model_only:
             camera, tracker = build_capture(args)
         if not args.cam_only:
-            controller = build_controller(args)
+            controller, extractor = build_robot(args)
+            if controller is None:
+                print("Il modello non soddisfa le assunzioni del retargeting: correggi il profilo "
+                      "o l'XML (oppure usa --no_validate a tuo rischio).")
+                return
 
         if args.model_only:
             run_model_only(controller)
         else:
-            run_pipeline(args, camera, tracker, controller)
+            run_pipeline(args, camera, tracker, controller, extractor)
     except KeyboardInterrupt:
         pass
     finally:

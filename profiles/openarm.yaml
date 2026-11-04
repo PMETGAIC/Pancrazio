@@ -1,0 +1,20 @@
+xml: ${PREFIX}/share/openarm_mujoco/v2/pedestal/openarm_pedestal.xml
+R_robot_from_mp:
+- [0, 0, -1]
+- [1, 0, 0]
+- [0, -1, 0]
+arms:
+- name: left
+  mp_indices: [11, 13, 15]
+  shoulder: openarm_left_link3
+  elbow: openarm_left_link4
+  ee: openarm_left_ee_base_link
+  rest_joints:
+    openarm_left_joint4: 0.8
+- name: right
+  mp_indices: [12, 14, 16]
+  shoulder: openarm_right_link3
+  elbow: openarm_right_link4
+  ee: openarm_right_ee_base_link
+  rest_joints:
+    openarm_right_joint4: 0.8
