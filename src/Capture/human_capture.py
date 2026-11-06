@@ -2,7 +2,9 @@
 
 Contenuto:
   - VideoIO         : ingresso (webcam o file) + registrazione opzionale
+  - RealSenseIO     : ingresso Intel RealSense (RGB + depth allineata) con la stessa interfaccia di VideoIO
   - OneEuroFilter   : filtro adattivo anti-jitter / anti-lag
+  - BodyLeveler     : compensa l'inclinazione della camera usando l'asse del busto (testa -> bacino)
   - PoseTracker     : detection pose + mani -> dict `state` (nessuna GUI)
   - draw_overlay    : disegna landmark e angoli su un frame
   - Skeleton3DPlot  : grafico matplotlib 3D live (solo debug, lento)
@@ -31,6 +33,11 @@ BONES = {
 COLORS = {'head': 'yellow', 'torso': 'blue', 'r_arm': 'red', 'l_arm': 'cyan', 'hand': 'green'}
 BONE_IDXS = {k: sorted({i for pair in v for i in pair}) for k, v in BONES.items()}
 
+# --- Asse del busto per la compensazione dell'inclinazione della camera -------
+LEVEL_HEAD = (7, 8)     # orecchie; con (11, 12) si usano le spalle: meno sensibile al collo piegato
+LEVEL_HIPS = (23, 24)   # fianchi
+UP = np.array([0.0, -1.0, 0.0])  # "su" nella convenzione MediaPipe (y verso il basso)
+
 
 # =============================================================================
 # Ingresso / uscita video
@@ -44,8 +51,9 @@ class VideoIO:
     In registrazione da webcam i frame vengono duplicati/saltati per avere fps costante nel file.
     """
 
-    def __init__(self, src=0, out_dir="./recording", width=640, height=480, fps=30, rec=False):
+    def __init__(self, src=1, out_dir="./recording", width=640, height=480, fps=30, rec=False):
         self.is_file = isinstance(src, str)
+        print(f"[video] sorgente: {src!r} ({'file' if self.is_file else 'webcam'})")
         self.cap = cv2.VideoCapture(src)
         if not self.cap.isOpened():
             raise RuntimeError(f"Impossibile aprire la sorgente video: {src!r}")
@@ -108,6 +116,85 @@ class VideoIO:
             self.writer.release()
 
 
+class RealSenseIO(VideoIO):
+    """Intel RealSense: RGB + depth allineata al colore. Stessa interfaccia di VideoIO.
+
+    In più espone `points_3d(px, py)`, che converte pixel (u, v) in punti 3D [m] nel sistema della
+    camera (x destra, y giù, z avanti) usando la depth misurata e le intrinseche del sensore colore.
+    Si registra solo il video a colori (la depth non viene salvata).
+    pyrealsense2 è importato qui: serve solo con --realsense.
+    """
+
+    def __init__(self, out_dir="./recording", width=640, height=480, fps=30, rec=False):
+        import pyrealsense2 as rs
+        print("[video] sorgente: RealSense")
+        self.is_file = False  # per write(): si comporta come una webcam (fps costante nel file)
+        self.fps = fps
+        self.rec = bool(rec and out_dir)
+        self.out_dir = out_dir
+        self.writer = None
+        self.frames_read = self.frames_written = 0
+        self._t0 = None
+        self._depth = None
+
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+        self.pipe = rs.pipeline()
+        profile = self.pipe.start(cfg)  # solleva RuntimeError se non c'è nessuna camera
+        self.align = rs.align(rs.stream.color)  # depth riproiettata nel frame del colore
+
+        self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()  # unità depth -> metri
+        intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        self.fx, self.fy, self.ppx, self.ppy = intr.fx, intr.fy, intr.ppx, intr.ppy
+
+        for _ in range(15):  # scarta i primi frame: l'auto-esposizione deve stabilizzarsi
+            self.pipe.wait_for_frames()
+
+    def read(self):
+        """Ritorna (ok, frame BGR, timestamp_ms); la depth del frame resta disponibile per points_3d()."""
+        try:
+            frames = self.align.process(self.pipe.wait_for_frames(5000))
+        except RuntimeError:  # timeout: camera scollegata o bloccata
+            return False, None, 0
+        color, depth = frames.get_color_frame(), frames.get_depth_frame()
+        if not color or not depth:
+            return False, None, 0
+
+        # copy(): i buffer appartengono al frame RealSense e possono essere riutilizzati
+        frame = np.asanyarray(color.get_data()).copy()
+        self._depth = np.asanyarray(depth.get_data()).copy()  # uint16, 0 = nessuna misura
+
+        if self._t0 is None:
+            self._t0 = time.time()
+        self.frames_read += 1
+        return True, frame, int((time.time() - self._t0) * 1000)
+
+    def points_3d(self, px, py, k=2):
+        """Pixel -> punti 3D [m] nel frame camera. Ritorna (N, 3), con NaN dove la depth non è valida.
+
+        La profondità è la mediana dei valori non nulli in una finestra (2k+1)x(2k+1): robusta ai buchi.
+        """
+        h, w = self._depth.shape
+        out = np.full((len(px), 3), np.nan)
+        for i, (x, y) in enumerate(zip(px, py)):
+            xi, yi = int(round(x)), int(round(y))
+            if not (0 <= xi < w and 0 <= yi < h):
+                continue
+            win = self._depth[max(yi - k, 0):yi + k + 1, max(xi - k, 0):xi + k + 1]
+            win = win[win > 0]
+            if win.size == 0:
+                continue
+            z = float(np.median(win)) * self.depth_scale
+            out[i] = ((x - self.ppx) * z / self.fx, (y - self.ppy) * z / self.fy, z)
+        return out
+
+    def release(self):
+        self.pipe.stop()
+        if self.writer:
+            self.writer.release()
+
+
 # =============================================================================
 # Filtro
 # =============================================================================
@@ -131,18 +218,114 @@ class OneEuroFilter:
         """Dimentica lo stato: il prossimo campione passa invariato (da usare quando il tracking si perde)."""
         self.x_prev = self.dx_prev = None
 
-    def __call__(self, x, dt=1 / 30.0):
+    def __call__(self, x, dt=1 / 30.0, valid_mask=None):
+        """Filtra `x`; con `valid_mask`, aggiorna solo gli elementi validi e conserva gli altri."""
+        x = np.asarray(x)
+        mask = (np.ones(x.shape, dtype=bool) if valid_mask is None else
+                np.broadcast_to(np.asarray(valid_mask, dtype=bool).reshape(
+                    (len(x),) + (1,) * (x.ndim - 1)), x.shape))
         if self.x_prev is None:
-            self.x_prev, self.dx_prev = x, np.zeros_like(x)
-            return x
-        dx = (x - self.x_prev) / dt
+            self.x_prev, self.dx_prev = x.copy(), np.zeros_like(x)
+            return self.x_prev
+        dx = np.where(mask, (x - self.x_prev) / dt, 0.0)
         a_d = 1.0 / (1.0 + (1.0 / (2 * np.pi * self.d_cutoff)) / dt)
         dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
         cutoff = self.min_cutoff + self.beta * np.abs(dx_hat)
         a = 1.0 / (1.0 + (1.0 / (2 * np.pi * cutoff)) / dt)
         x_hat = a * x + (1 - a) * self.x_prev
-        self.x_prev, self.dx_prev = x_hat, dx_hat
-        return x_hat
+        self.x_prev = np.where(mask, x_hat, self.x_prev)
+        self.dx_prev = np.where(mask, dx_hat, self.dx_prev)
+        return self.x_prev
+
+
+# =============================================================================
+# Compensazione inclinazione camera
+# =============================================================================
+class BodyLeveler:
+    """Raddrizza posa e mani rispetto all'asse del busto, per compensare una camera inclinata.
+
+    Si misura UNA volta, con la persona dritta e ferma, l'asse bacino -> testa (media su `n_frames`
+    frame validi) e si calcola la rotazione minima che lo porta sulla verticale; poi la stessa
+    rotazione si applica a ogni frame. Non si ricalcola a ogni frame: altrimenti il sistema ruoterebbe
+    con te quando ti pieghi in avanti.
+
+    Compensa pitch e roll della camera. Lo yaw non è definito dall'asse del busto e resta com'è:
+    la camera deve inquadrarti più o meno di fronte.
+
+    Parte subito a raccogliere i frame; finché la prima calibrazione non è finita azzera pose e mani,
+    così il robot non riceve comandi. `recalibrate()` ne avvia un'altra e nel frattempo continua ad
+    applicare la rotazione precedente. `ready` dice quando la rotazione è valida e stabile.
+    """
+
+    def __init__(self, n_frames=30, vis_min=0.5):
+        self.n_frames = n_frames
+        self.vis_min = vis_min
+        self.R = np.eye(3)
+        self.calibrated = False
+        self._buf = []
+        self._collecting = True
+        print(f"[level] mettiti dritto e fermo davanti alla camera: calibro l'inclinazione su "
+              f"{n_frames} frame (premi 'b' per ripetere)")
+
+    @property
+    def ready(self):
+        """True se esiste una rotazione valida e non è in corso una (ri)calibrazione."""
+        return self.calibrated and not self._collecting
+
+    def recalibrate(self):
+        self._buf = []
+        self._collecting = True
+        print("[level] ricalibrazione: resta dritto e fermo")
+
+    def __call__(self, state):
+        """Modifica `state` e lo ritorna: 'pose' e 'hands'[i]['pts'] ruotati nel frame raddrizzato."""
+        pose = state['pose']
+        if self._collecting and pose is not None:
+            self._collect(pose, state['visibility'])
+        if not self.calibrated:  # prima calibrazione in corso: nessun comando (evita salti del robot)
+            state['pose'], state['hands'] = None, []
+            return state
+        # Nuovi array (niente modifica in place): i filtri One Euro tengono un riferimento ai loro
+        if pose is not None:
+            state['pose'] = pose @ self.R.T
+        for h in state['hands']:
+            h['pts'] = h['pts'] @ self.R.T
+        return state
+
+    # ---- Interni -----------------------------------------------------------
+    def _collect(self, pose, vis):
+        idx = list(LEVEL_HEAD + LEVEL_HIPS)
+        if vis is not None and vis[idx].min() < self.vis_min:
+            return
+        axis = pose[list(LEVEL_HEAD)].mean(axis=0) - pose[list(LEVEL_HIPS)].mean(axis=0)
+        n = np.linalg.norm(axis)
+        if n < 1e-6:
+            return
+        self._buf.append(axis / n)
+        if len(self._buf) >= self.n_frames:
+            self._finish()
+
+    def _finish(self):
+        a = np.mean(self._buf, axis=0)
+        a /= np.linalg.norm(a)
+        self.R = self._rot_between(a, UP)
+        self.calibrated, self._collecting = True, False
+        tilt = float(np.degrees(np.arccos(np.clip(a @ UP, -1.0, 1.0))))
+        print(f"[level] calibrato: l'asse del busto risultava inclinato di {tilt:.1f} gradi rispetto alla verticale")
+        if tilt > 60:
+            print("[level] avviso: inclinazione molto grande, controlla di essere dritto e ben inquadrato")
+
+    @staticmethod
+    def _rot_between(a, b):
+        """Rotazione minima (3, 3) che porta il versore a sul versore b (formula di Rodrigues)."""
+        v = np.cross(a, b)
+        c = float(a @ b)
+        if c < -0.999:  # asse quasi capovolto: la rotazione minima non è definita
+            return np.eye(3)
+        K = np.array([[0.0, -v[2], v[1]],
+                      [v[2], 0.0, -v[0]],
+                      [-v[1], v[0], 0.0]])
+        return np.eye(3) + K + K @ K / (1.0 + c)
 
 
 # =============================================================================
@@ -151,10 +334,16 @@ class OneEuroFilter:
 class PoseTracker:
     """Rileva posa e mani e restituisce uno `state` (dict). Non apre finestre e non disegna.
 
+    Con `level=True` (default) e la posa attiva, posa e mani sono raddrizzate sull'asse del busto
+    (vedi BodyLeveler); nei primi frame di calibrazione 'pose' e 'hands' restano vuoti.
+
     state = {
-        'pose':       (33, 3) world landmarks filtrate [m], oppure None
+        'pose':       (33, 3) landmarks filtrate [m], origine al bacino, oppure None.
+                      Con una RealSense la profondità è misurata; altrimenti sono le world landmarks MediaPipe.
+                      Raddrizzate sull'asse del busto se `level` è attivo
         'visibility': (33,)   visibilità per landmark in [0, 1], oppure None
         'pose_2d':    landmark normalizzati MediaPipe (per overlay/plot), oppure None
+        'depth_ref':  distanza [m] del bacino dalla camera (solo con RealSense), altrimenti None
         'angles':     {'l_elbow': deg, 'r_elbow': deg}
         'hands':      [{'side': 'left'|'right', 'pts': (21, 3) [m],
                         'pinch': 0..1 (0 = pollice-indice a contatto, 1 = aperta),
@@ -164,7 +353,7 @@ class PoseTracker:
     """
 
     def __init__(self, models_dir="models", pose_model="pose_landmarker_lite.task",
-                 use_pose=True, use_hands=True, min_cutoff=0.5, beta=0.01):
+                 use_pose=True, use_hands=True, min_cutoff=0.5, beta=0.01, level=True):
         md = os.path.abspath(models_dir)
         self.pose_det = self.hand_det = None
 
@@ -182,12 +371,16 @@ class PoseTracker:
 
         self.pose_filter = OneEuroFilter(min_cutoff, beta)
         self.hand_filters = {s: OneEuroFilter(min_cutoff, beta) for s in ('left', 'right')}
+        self.leveler = BodyLeveler() if (level and use_pose) else None  # senza posa non c'è asse del busto
         self._last_ts = -1
 
     # ---- API pubblica ------------------------------------------------------
-    def process(self, frame, ts):
-        """frame BGR + timestamp [ms] -> state."""
-        state = {'pose': None, 'visibility': None, 'pose_2d': None,
+    def process(self, frame, ts, depth_cam=None):
+        """frame BGR + timestamp [ms] -> state.
+
+        depth_cam: oggetto con `points_3d(px, py)` (RealSenseIO) per usare la depth misurata; None = solo MediaPipe.
+        """
+        state = {'pose': None, 'visibility': None, 'pose_2d': None, 'depth_ref': None,
                  'angles': {'l_elbow': 0.0, 'r_elbow': 0.0}, 'hands': [], 'hands_2d': []}
         if frame is None:
             return state
@@ -201,9 +394,21 @@ class PoseTracker:
         p_res = self.pose_det.detect_for_video(mpi, ts) if self.pose_det else None
         h_res = self.hand_det.detect_for_video(mpi, ts) if self.hand_det else None
 
-        pts = self._process_pose(p_res, dt, state)
+        pts = self._process_pose(p_res, dt, state, frame.shape, depth_cam)
         self._process_hands(h_res, pts, dt, state)
+        if self.leveler:
+            self.leveler(state)  # per ultimo: filtri, angoli e pinch/openness lavorano sui dati grezzi
         return state
+
+    @property
+    def level_ready(self):
+        """True se il frame di riferimento è stabile: raddrizzamento spento, oppure calibrato e non in corso."""
+        return self.leveler is None or self.leveler.ready
+
+    def recalibrate_level(self):
+        """Ripete la calibrazione dell'inclinazione (persona dritta e ferma). Senza effetto se level è spento."""
+        if self.leveler:
+            self.leveler.recalibrate()
 
     def close(self):
         if self.pose_det:
@@ -212,17 +417,52 @@ class PoseTracker:
             self.hand_det.close()
 
     # ---- Interni -----------------------------------------------------------
-    def _process_pose(self, p_res, dt, state):
+    def _process_pose(self, p_res, dt, state, shape, depth_cam):
         if not (p_res and p_res.pose_world_landmarks):
-            self.pose_filter.reset()  # al ritorno non si trascina uno stato vecchio
             return None
         world = p_res.pose_world_landmarks[0]
-        pts = self.pose_filter(np.array([[lm.x, lm.y, lm.z] for lm in world]), dt)
+        raw = np.array([[lm.x, lm.y, lm.z] for lm in world])
         vis = np.array([1.0 if lm.visibility is None else lm.visibility for lm in world])
-        state.update(pose=pts, visibility=vis, pose_2d=p_res.pose_landmarks[0],
+        lm2d = p_res.pose_landmarks[0]
+
+        depth_ref = None
+        if depth_cam is not None:
+            raw, depth_ref = self._fuse_depth(raw, vis, lm2d, shape, depth_cam)
+
+        valid = (vis >= 0.5) & np.isfinite(raw).all(axis=1)
+        pts = self.pose_filter(raw, dt, valid_mask=valid)
+        state.update(pose=pts, visibility=vis, pose_2d=lm2d, depth_ref=depth_ref,
                      angles={'l_elbow': self._angle(pts, 11, 13, 15),
                              'r_elbow': self._angle(pts, 12, 14, 16)})
         return pts
+
+    @staticmethod
+    def _fuse_depth(world, vis, lm2d, shape, cam, min_vis=0.5, max_dev=0.3):
+        """Sostituisce la z stimata da MediaPipe con la depth misurata dalla camera.
+
+        Ritorna (landmarks (33, 3) [m] centrate sul bacino, distanza del bacino dalla camera [m]).
+        Dove la depth manca, il landmark è poco visibile o la misura si discosta più di `max_dev` [m]
+        dalla z di MediaPipe (es. polso nascosto che "vede" la parete dietro), si usa la z di MediaPipe
+        traslata di un offset (mediana sui landmark validi). Se i landmark validi sono troppo pochi
+        si ripiega interamente sulle world landmarks.
+        """
+        h, w = shape[:2]
+        px = np.array([l.x * w for l in lm2d])
+        py = np.array([l.y * h for l in lm2d])
+        z_meas = cam.points_3d(px, py)[:, 2]  # NaN dove la depth non è valida
+
+        ok = ~np.isnan(z_meas) & (vis > min_vis)
+        if ok.sum() < 4:
+            return world, None
+        offset = np.median(z_meas[ok] - world[ok, 2])  # world z è relativa al bacino, z_meas è assoluta
+        ok &= np.abs(z_meas - (world[:, 2] + offset)) < max_dev
+        if ok.sum() < 4:
+            return world, None
+
+        z = np.where(ok, z_meas, world[:, 2] + offset)
+        pts = np.column_stack(((px - cam.ppx) * z / cam.fx, (py - cam.ppy) * z / cam.fy, z))
+        hip = pts[[23, 24]].mean(axis=0)  # stessa convenzione di MediaPipe: origine al centro del bacino
+        return pts - hip, float(hip[2])
 
     def _process_hands(self, h_res, pts, dt, state):
         seen = set()
@@ -311,9 +551,10 @@ def draw_overlay(frame, state):
 class Skeleton3DPlot:
     """Scheletro 3D live con matplotlib. Lento (plt.pause): solo per debug.
 
-    La profondità assoluta NON è nota (le world landmarks sono relative al bacino): per avere un
-    riferimento nel grafico la si stima con un modello pinhole, Z = f * W / w_px, dove W è la larghezza
-    spalle reale e w_px quella misurata nell'immagine. FOCAL_PX dipende da camera e risoluzione.
+    Con la RealSense la distanza dalla camera è misurata (`state['depth_ref']`). Altrimenti la profondità
+    assoluta NON è nota (le world landmarks sono relative al bacino): la si stima con un modello pinhole,
+    Z = f * W / w_px, dove W è la larghezza spalle reale e w_px quella misurata nell'immagine.
+    FOCAL_PX dipende da camera e risoluzione.
     """
     SHOULDER_WIDTH_M = 0.4
     FOCAL_PX = 800.0
@@ -333,9 +574,11 @@ class Skeleton3DPlot:
         if self._n % self.every:
             return
 
-        h, w = frame_shape[:2]
-        shoulder_px = max(np.hypot((p2d[11].x - p2d[12].x) * w, (p2d[11].y - p2d[12].y) * h), 1e-5)
-        z_off = self.SHOULDER_WIDTH_M * self.FOCAL_PX / shoulder_px
+        z_off = state.get('depth_ref')  # misurata (RealSense)
+        if z_off is None:  # stimata (pinhole)
+            h, w = frame_shape[:2]
+            shoulder_px = max(np.hypot((p2d[11].x - p2d[12].x) * w, (p2d[11].y - p2d[12].y) * h), 1e-5)
+            z_off = self.SHOULDER_WIDTH_M * self.FOCAL_PX / shoulder_px
 
         def to_plot(p):  # MediaPipe (x, y, z) -> assi del grafico (X, Z, Y), con Y verso l'alto
             return np.column_stack((p[:, 0], p[:, 2] + z_off, -p[:, 1]))
